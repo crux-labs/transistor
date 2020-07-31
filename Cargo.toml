@@ -10,7 +10,8 @@ keywords = ["CRUX", "Client", "EDN", "database", "Datalog"]
 license = "LGPL-3.0"
 edition = "2018"
 
-
+[features]
+async = []
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
@@ -19,3 +20,4 @@ edn-rs = "0.10.0"
 
 [dev-dependencies]
 mockito = "0.26"
+tokio = "0.2"

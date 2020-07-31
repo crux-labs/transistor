@@ -6,13 +6,21 @@ use crate::types::{
     },
 };
 use edn_rs::{edn, Edn, Map, Serialize};
-use reqwest::{blocking::Client, header::HeaderMap};
+use reqwest::{header::HeaderMap};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// `DockerClient` has the `reqwest::blocking::Client`,  the `uri` to query and the `HeaderMap` with
 /// all the possible headers. Default header is `Content-Type: "application/edn"`. Synchronous request.
+#[cfg(not(feature = "async"))]
 pub struct DockerClient {
-    pub(crate) client: Client,
+    pub(crate) client: reqwest::blocking::Client,
+    pub(crate) uri: String,
+    pub(crate) headers: HeaderMap,
+}
+
+#[cfg(feature = "async")]
+pub struct DockerClient {
+    pub(crate) client: reqwest::Client,
     pub(crate) uri: String,
     pub(crate) headers: HeaderMap,
 }
@@ -47,6 +55,7 @@ impl Serialize for Action {
     }
 }
 
+#[cfg(not(feature = "async"))]
 impl DockerClient {
     /// Function `state` queries endpoint `/` with a `GET`. Returned information consists of
     /// various details about the state of the database and it can be used as a health check.
@@ -203,6 +212,144 @@ impl DockerClient {
     }
 }
 
+#[cfg(feature = "async")]
+impl DockerClient {
+    pub async fn state(&self) -> Result<StateResponse, CruxError> {
+        let resp = self
+            .client
+            .get(&self.uri)
+            .headers(self.headers.clone())
+            .send().await?
+            .text().await?;
+        StateResponse::deserialize(resp)
+    }
+
+    pub async fn tx_log(&self, actions: Vec<Action>) -> Result<TxLogResponse, CruxError> {
+        let actions_str = actions
+            .into_iter()
+            .map(|edn| edn.serialize())
+            .collect::<Vec<String>>()
+            .join(", ");
+        let mut s = String::new();
+        s.push_str("[");
+        s.push_str(&actions_str);
+        s.push_str("]");
+
+        let resp = self
+            .client
+            .post(&format!("{}/tx-log", self.uri))
+            .headers(self.headers.clone())
+            .body(s)
+            .send().await?
+            .text().await?;
+        TxLogResponse::deserialize(resp)
+    }
+
+    pub async fn tx_logs(&self) -> Result<TxLogsResponse, CruxError> {
+        let resp = self
+            .client
+            .get(&format!("{}/tx-log", self.uri))
+            .headers(self.headers.clone())
+            .send().await?
+            .text().await?;
+        TxLogsResponse::deserialize(resp)
+    }
+
+    pub async fn entity(&self, id: String) -> Result<Edn, CruxError> {
+        if !id.starts_with(":") {
+            return Ok(edn!({:status ":bad-request", :message "ID required", :code 400}));
+        }
+
+        let mut s = String::new();
+        s.push_str("{:eid ");
+        s.push_str(&id);
+        s.push_str("}");
+
+        let resp = self
+            .client
+            .post(&format!("{}/entity", self.uri))
+            .headers(self.headers.clone())
+            .body(s)
+            .send().await?
+            .text().await?;
+
+        let edn_resp = edn_rs::parse_edn(&resp);
+        Ok(match edn_resp {
+            Ok(e) => e,
+            Err(err) => {
+                println!(":CRUX-CLIENT POST /entity [ERROR]: {:?}", err);
+                edn!({:status ":internal-server-error", :code 500})
+            }
+        })
+    }
+
+    pub async fn entity_tx(&self, id: String) -> Result<EntityTxResponse, CruxError> {
+        let mut s = String::new();
+        s.push_str("{:eid ");
+        s.push_str(&id);
+        s.push_str("}");
+
+        let resp = self
+            .client
+            .post(&format!("{}/entity-tx", self.uri))
+            .headers(self.headers.clone())
+            .body(s)
+            .send().await?
+            .text().await?;
+
+        EntityTxResponse::deserialize(resp)
+    }
+
+    pub async fn document_by_id(&self, content_hash: String) -> Result<Edn, CruxError> {
+        let resp = self
+            .client
+            .get(&format!("{}/document/{}", self.uri, content_hash))
+            .headers(self.headers.clone())
+            .send().await?
+            .text().await?;
+
+        Ok(edn_rs::parse_edn(&resp)?)
+    }
+
+    pub async fn documents(
+        &self,
+        content_hashes: Vec<String>,
+    ) -> Result<BTreeMap<String, Edn>, CruxError> {
+        let mut s = String::new();
+        s.push_str("#{");
+        s.push_str(
+            &content_hashes
+                .iter()
+                .map(|hash| format!("{:?}", hash))
+                .collect::<Vec<String>>()
+                .join(", "),
+        );
+        s.push_str("}");
+
+        let resp = self
+            .client
+            .post(&format!("{}/documents", self.uri))
+            .headers(self.headers.clone())
+            .body(s)
+            .send().await?
+            .text().await?;
+
+        Documents::deserialize(resp, content_hashes)
+    }
+
+    pub async fn query(&self, query: Query) -> Result<BTreeSet<Vec<String>>, CruxError> {
+        let resp = self
+            .client
+            .post(&format!("{}/query", self.uri))
+            .headers(self.headers.clone())
+            .body(query.serialize())
+            .send().await?
+            .text().await?;
+
+        QueryResponse::deserialize(resp)
+    }
+}
+
 #[cfg(test)]
 mod docker {
     use super::Action;
@@ -287,12 +434,15 @@ mod docker {
     #[should_panic(expected = "The following Edn cannot be parsed to TxLogs: Symbol(\\\"Holy\\\")")]
     fn tx_log_error() {
         let _m = mock("GET", "/tx-log")
-        .with_status(200)
-        .with_header("content-type", "application/edn")
-        .with_body("Holy errors!")
-        .create();
+            .with_status(200)
+            .with_header("content-type", "application/edn")
+            .with_body("Holy errors!")
+            .create();
 
-        let _error = Crux::new("localhost", "4000").docker_client().tx_logs().unwrap();
+        let _error = Crux::new("localhost", "4000")
+            .docker_client()
+            .tx_logs()
+            .unwrap();
     }
 
     #[test]
@@ -392,8 +542,10 @@ mod docker {
             .with_body(expected_body)
             .create();
 
-        let query = Query::find(vec!["?p1", "?n", "?s"]).unwrap()
-            .where_clause(vec!["?p1 :name ?n", "?p1 :is-sql ?s", "?p1 :is-sql true"]).unwrap()
+        let query = Query::find(vec!["?p1", "?n", "?s"])
+            .unwrap()
+            .where_clause(vec!["?p1 :name ?n", "?p1 :is-sql ?s", "?p1 :is-sql true"])
+            .unwrap()
             .build();
         let body = Crux::new("localhost", "3000")
             .docker_client()
